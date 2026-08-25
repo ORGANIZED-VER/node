@@ -1,0 +1,16 @@
+{
+  "name": "Telegram Bot MailDiggerPro",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "forwardPorts": [
+    3000,
+    8000
+  ],
+  "portsAttributes": {
+    "3000": {
+      "label": "Mini App Viewer",
+      "onAutoForward": "openBrowser",
+      "visibility": "public"
+    }
+  },
+  "postCreateCommand": "pip install -r requirements.txt"
+}
