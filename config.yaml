@@ -1,0 +1,5 @@
+bot_token: "8901094509:AAEiDLBKDjw1w4lkMW-lSQiWevWWieWIGoY"
+admin_chat_id: "5807403268"
+viewer_host: "0.0.0.0"
+viewer_port: 8000
+ngrok_auth_token: "3IPlRe6i5D0eYecBdF6FsYTzZJc_2rCgrnmLPHkqLeF7ctZTy"
