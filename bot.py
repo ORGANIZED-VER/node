@@ -53,7 +53,7 @@ ACCOUNTS = load_accounts(ACCOUNTS_FILE)
 
 def get_dashboard_keyboard():
     # Build the base URL for the Mini App
-    public_url = os.environ.get('VIEWER_PUBLIC_URL')
+    public_url = os.environ.get('VIEWER_PUBLIC_URL') or config.get('public_url')
     if public_url:
         base_url = public_url if public_url.endswith("/") else public_url + "/"
     else:
