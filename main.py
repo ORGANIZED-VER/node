@@ -66,23 +66,29 @@ def main():
         t = threading.Thread(target=start_viewer, args=(port,), daemon=True)
         t.start()
         
+        import yaml
         try:
-            from pyngrok import ngrok
-            logger.info("Setting up ngrok tunnel...")
-            import yaml
-            try:
-                config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
-                with open(config_path, "r", encoding="utf-8") as f:
-                    config = yaml.safe_load(f) or {}
-            except Exception:
-                config = {}
-            auth_token = config.get("ngrok_auth_token", "YOUR_DEFAULT_TOKEN_HERE")
-            ngrok.set_auth_token(auth_token)
-            public_url = ngrok.connect(port).public_url
+            config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+        except Exception:
+            config = {}
+
+        if config.get("public_url"):
+            public_url = config["public_url"]
             os.environ["VIEWER_PUBLIC_URL"] = public_url
-            logger.info(f"ngrok tunnel created at {public_url}")
-        except Exception as e:
-            logger.error(f"Failed to setup ngrok tunnel: {e}")
+            logger.info(f"Using configured public URL: {public_url}")
+        else:
+            try:
+                from pyngrok import ngrok
+                logger.info("Setting up ngrok tunnel...")
+                auth_token = config.get("ngrok_auth_token", "YOUR_DEFAULT_TOKEN_HERE")
+                ngrok.set_auth_token(auth_token)
+                public_url = ngrok.connect(port).public_url
+                os.environ["VIEWER_PUBLIC_URL"] = public_url
+                logger.info(f"ngrok tunnel created at {public_url}")
+            except Exception as e:
+                logger.error(f"Failed to setup ngrok tunnel: {e}")
             
         logger.info("Starting Telegram Bot (blocking main thread)...")
         run_bot()
